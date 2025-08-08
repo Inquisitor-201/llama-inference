@@ -1,7 +1,24 @@
 import json
 import torch
+import torch.nn as nn
 from safetensors.torch import load_file
 from typing import Dict, Any, Tuple
+import math
+from transformers import AutoTokenizer
+
+# 修复的RMSNorm实现
+class FixedRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
 ACTFN_MAP = {
     "relu": torch.nn.ReLU,
@@ -28,11 +45,13 @@ class GroupedQueryAttention(torch.nn.Module):
         self.o_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
 
     def _rope(self, x):
+        # x: [batch_size, num_heads, seq_len, head_dim]
         batch_size, num_heads, seq_len, head_dim = x.shape
         device = x.device
+        assert head_dim % 2 == 0, "head_dim must be even for RoPE"
 
         # 生成频率（仅计算前半部分）
-        theta = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2, device=device)[:head_dim//2] / head_dim))
+        theta = 1.0 / (self.theta ** (torch.arange(0, head_dim, 2, device=device)[:head_dim//2] / head_dim))
         seq_idx = torch.arange(seq_len, device=device).unsqueeze(1)
         freqs = seq_idx * theta  # [seq_len, dim//2]
 
@@ -48,24 +67,37 @@ class GroupedQueryAttention(torch.nn.Module):
         return rotated
 
     def forward(self, x):
-        # 自定义注意力计算逻辑
+        # x: [batch_size, seq_len, hidden_size]
         batch_size, seq_len, _ = x.shape
-        
-        # 自定义实现的投影操作
+
+        # 线性投影到多头
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads_q, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.num_heads_kv, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_heads_kv, self.head_dim).transpose(1, 2)
-        
-        print("q=", q[0], "k=", k[0], "v=", v[0])
+
+        # q: [batch_size, num_heads_q, seq_len, head_dim]
+        # k/v: [batch_size, num_heads_kv, seq_len, head_dim]
+
         q, k = self._rope(q), self._rope(k)
 
-        print("q.shape:", q.shape, "k.shape:", k.shape, "v.shape:", v.shape)
-        # 自定义注意力计算（示例）
+        # 将 kv 头拓展以匹配 q 头（GQA）
+        if self.q_per_kv > 1:
+            k = k.repeat_interleave(self.q_per_kv, dim=1)
+            v = v.repeat_interleave(self.q_per_kv, dim=1)
+            # k/v: [batch_size, num_heads_q, seq_len, head_dim]
+
+        # 缩放点积注意力 + 因果掩码
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        # attn_weights: [batch_size, num_heads_q, seq_len, seq_len]
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+        # causal_mask: [seq_len, seq_len]
+        attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
         attn_weights = torch.softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, v)
-        
+        # attn_output: [batch_size, num_heads_q, seq_len, head_dim]
+
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        # attn_output (merged heads): [batch_size, seq_len, hidden_size]
         return self.o_proj(attn_output)
 
 class MLP(torch.nn.Module):
@@ -77,6 +109,7 @@ class MLP(torch.nn.Module):
         self.down_proj = torch.nn.Linear(config["intermediate_size"], config["hidden_size"], bias=False)
 
     def forward(self, x):
+        # x: [batch_size, seq_len, hidden_size]
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class CustomLlamaModel(torch.nn.Module):
@@ -86,16 +119,20 @@ class CustomLlamaModel(torch.nn.Module):
         self.vocab_size = config["vocab_size"]
         self.hidden_size = config["hidden_size"]
 
-        # 嵌入层
+        # 嵌入层: 将 token id 映射到向量
         self.embed_tokens = torch.nn.Embedding(self.vocab_size, self.hidden_size)
-        
+        # embed_tokens.weight: [vocab_size, hidden_size]
+
         # 自定义实现的Transformer层
         self.layers = torch.nn.ModuleList([
             self.create_decoder_layer(config) for _ in range(config["num_hidden_layers"])
         ])
+
+        # 输出层归一化
+        self.norm = FixedRMSNorm(self.hidden_size, eps=config["rms_norm_eps"])
         
-    #     # 输出层
-    #     self.norm = torch.nn.LayerNorm(self.hidden_size)
+        # 独立的lm_head层
+        self.lm_head = torch.nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 
     def create_decoder_layer(self, config):
         """创建包含自定义算子的Transformer层"""
@@ -107,29 +144,35 @@ class CustomLlamaModel(torch.nn.Module):
                 theta=config["rope_theta"]
             ),
             "mlp": MLP(config),
-            "input_layernorm": torch.nn.RMSNorm(config["hidden_size"], eps=config["rms_norm_eps"]),
-            "post_attention_layernorm": torch.nn.RMSNorm(config["hidden_size"], eps=config["rms_norm_eps"])
+            "input_layernorm": FixedRMSNorm(config["hidden_size"], eps=config["rms_norm_eps"]),
+            "post_attention_layernorm": FixedRMSNorm(config["hidden_size"], eps=config["rms_norm_eps"])
         })
 
     def forward(self, input_ids):
+        # input_ids: [batch_size, seq_len]
         x = self.embed_tokens(input_ids)
-        
-        # print("x=", x)
+        # x (embeddings): [batch_size, seq_len, hidden_size]
 
         for layer in self.layers:
             residual = x
             x = layer["input_layernorm"](x)
             x = layer["self_attn"](x)
             x = residual + x
-            
+
             residual = x
             x = layer["post_attention_layernorm"](x)
             x = layer["mlp"](x)
             x = residual + x
-            
-        # x = self.norm(x)
-        return x
 
+        x = self.norm(x)
+        # x (final hidden): [batch_size, seq_len, hidden_size]
+        last_hidden = x[:, -1, :]
+        # last_hidden: [batch_size, hidden_size]
+        
+        # 使用独立的lm_head层
+        logits = self.lm_head(last_hidden)
+        # logits: [batch_size, vocab_size]
+        return logits
 
 # 3. 加载配置和权重的工具函数
 def load_llama_config(config_path: str = "config.json") -> Dict[str, Any]:
@@ -151,26 +194,108 @@ def map_weights_to_custom_model(
 
     # 加载权重到自定义模型
     custom_state_dict = custom_model.state_dict()
+    mapped_count = 0
+    total_count = len(custom_state_dict)
+    
     for custom_name in custom_state_dict.keys():
-        orig_name = "model." + custom_name
-        if orig_name in original_weights:
-            # 确保权重形状匹配
-            if original_weights[orig_name].shape == custom_state_dict[custom_name].shape:
-                custom_state_dict[custom_name].copy_(original_weights[orig_name])
-                print(f"加载权重: {orig_name} -> {custom_name}, shape: {original_weights[orig_name].shape}")
+        if custom_name == "lm_head.weight":
+            # lm_head权重应该与embed_tokens权重相同（权重绑定）
+            if "model.embed_tokens.weight" in original_weights:
+                custom_state_dict[custom_name].copy_(original_weights["model.embed_tokens.weight"])
+                print(f"✅ 加载权重: model.embed_tokens.weight -> {custom_name}, shape: {original_weights['model.embed_tokens.weight'].shape}")
+                mapped_count += 1
             else:
-                print(f"警告: 权重形状不匹配 - {orig_name} vs {custom_name}, shape: {original_weights[orig_name].shape} vs {custom_state_dict[custom_name].shape}")
+                print(f"❌ 警告: 未找到embed_tokens权重用于lm_head")
+        elif custom_name == "embed_tokens.weight":
+            # embed_tokens权重
+            orig_name = "model." + custom_name
+            if orig_name in original_weights:
+                custom_state_dict[custom_name].copy_(original_weights[orig_name])
+                print(f"✅ 加载权重: {orig_name} -> {custom_name}, shape: {original_weights[orig_name].shape}")
+                mapped_count += 1
+            else:
+                print(f"❌ 警告: 未找到权重 - {orig_name}")
         else:
-            print(f"警告: 未找到权重 - {orig_name}")
+            orig_name = "model." + custom_name
+            if orig_name in original_weights:
+                # 确保权重形状匹配
+                if original_weights[orig_name].shape == custom_state_dict[custom_name].shape:
+                    custom_state_dict[custom_name].copy_(original_weights[orig_name])
+                    print(f"✅ 加载权重: {orig_name} -> {custom_name}, shape: {original_weights[orig_name].shape}")
+                    mapped_count += 1
+                else:
+                    print(f"❌ 警告: 权重形状不匹配 - {orig_name} vs {custom_name}, shape: {original_weights[orig_name].shape} vs {custom_state_dict[custom_name].shape}")
+            else:
+                print(f"❌ 警告: 未找到权重 - {orig_name}")
+    
+    print(f"权重映射完成: {mapped_count}/{total_count} 个权重已映射")
     
     custom_model.load_state_dict(custom_state_dict)
     return custom_model
 
 
-# 4. 主函数：加载模型并测试
+# 4. 采样函数
+def sample_top_p(probs, p):
+    """Top-p (nucleus) sampling"""
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    sorted_indices_to_remove = cumulative_probs > p
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = 0
+    
+    indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+    probs[indices_to_remove] = 0.0
+    return probs
+
+def sample_top_k(probs, k):
+    """Top-k sampling"""
+    top_k_probs, top_k_indices = torch.topk(probs, k, dim=-1)
+    mask = torch.zeros_like(probs, dtype=torch.bool)
+    mask.scatter_(-1, top_k_indices, True)
+    probs[~mask] = 0.0
+    return probs
+
+def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, temperature=0.0):
+    """自回归生成tokens"""
+    model.eval()
+    generated_tokens = input_ids.clone()
+    
+    with torch.no_grad():
+        for _ in range(max_tokens):
+            # 获取logits
+            logits = model(generated_tokens)  # [batch_size, vocab_size]
+            
+            # 贪婪采样：直接选择最大概率的token
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            
+            # 添加到生成的序列中
+            generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
+            
+            # 检查是否生成了结束token
+            if next_token.item() == tokenizer.eos_token_id:
+                break
+    
+    return generated_tokens
+
+def decode_tokens_to_text(tokenizer, tokens):
+    """将tokens解码为文本"""
+    # 移除batch维度
+    if tokens.dim() > 1:
+        tokens = tokens[0]
+    
+    # 解码为文本
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
+    return text
+
+# 5. 主函数：加载模型并测试
 def main():
     # 加载配置
     config = load_llama_config("models/TinyStories-656K/config.json")
+    
+    # 加载tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("models/TinyStories-656K/")
+    print(f"Tokenizer词汇表大小: {tokenizer.vocab_size}")
+    print(f"EOS token ID: {tokenizer.eos_token_id}")
     
     # 创建自定义模型
     custom_model = CustomLlamaModel(config)
@@ -184,11 +309,56 @@ def main():
     
     print("自定义模型权重加载完成!")
     
-    # 简单测试
+    # 测试自回归生成
     with torch.no_grad():
-        input_ids = torch.tensor([[1, 80, 425]])  # 示例输入
-        output = custom_model(input_ids)
-        print(f"模型输出形状: {output.shape}")
+        # # 准备输入文本
+        input_text = "One day, a girl named Lily went for a "
+        print(f"\n输入文本: '{input_text}'")
+        
+        # # 编码输入文本
+        input_ids = tokenizer.encode(input_text, return_tensors="pt", add_special_tokens=True)
+        print(f"输入tokens: {input_ids[0].tolist()}")
+        
+        # # 调试：比较与main.py的差异
+        # print(f"main.py的输入tokens: [1, 80, 429, 1168, 303, 1444]")
+        # print(f"我们的输入tokens: {input_ids[0].tolist()}")
+        
+        # 检查tokenizer是否正确
+        # decoded_back = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        # print(f"解码回文本: '{decoded_back}'")
+        
+        # 测试logits输出
+        print("\n=== 测试logits输出 ===")
+        logits = custom_model(input_ids)
+        print("logits:", logits.reshape(-1,)[64:128])
+
+        # # 自回归生成
+        print("\n开始自回归生成...")
+        generated_tokens = generate_tokens_autoregressive(
+            custom_model, 
+            tokenizer, 
+            input_ids, 
+            max_tokens=100
+        )
+        
+        print('generated_tokens:', generated_tokens)
+        # # 解码生成的文本
+        generated_text = decode_tokens_to_text(tokenizer, generated_tokens)
+        
+        print(f"\n生成的tokens: {generated_tokens[0].tolist()}")
+        print(f"生成的文本: '{generated_text}'")
+        
+        # # 显示生成过程
+        # print("\n生成过程:")
+        # current_tokens = input_ids.clone()
+        # for i in range(min(10, len(generated_tokens[0]) - len(input_ids[0]))):
+        #     current_text = decode_tokens_to_text(tokenizer, current_tokens)
+        #     print(f"步骤 {i+1}: '{current_text}'")
+            
+        #     # 获取下一个token
+        #     logits = custom_model(current_tokens)
+        #     next_token = torch.argmax(logits, dim=-1, keepdim=True)
+        #     current_tokens = torch.cat([current_tokens, next_token], dim=-1)
 
 if __name__ == "__main__":
     main()
