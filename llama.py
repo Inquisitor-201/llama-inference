@@ -206,15 +206,6 @@ def map_weights_to_custom_model(
                 mapped_count += 1
             else:
                 print(f"❌ 警告: 未找到embed_tokens权重用于lm_head")
-        elif custom_name == "embed_tokens.weight":
-            # embed_tokens权重
-            orig_name = "model." + custom_name
-            if orig_name in original_weights:
-                custom_state_dict[custom_name].copy_(original_weights[orig_name])
-                print(f"✅ 加载权重: {orig_name} -> {custom_name}, shape: {original_weights[orig_name].shape}")
-                mapped_count += 1
-            else:
-                print(f"❌ 警告: 未找到权重 - {orig_name}")
         else:
             orig_name = "model." + custom_name
             if orig_name in original_weights:
@@ -235,27 +226,57 @@ def map_weights_to_custom_model(
 
 
 # 4. 采样函数
-def sample_top_p(probs, p):
-    """Top-p (nucleus) sampling"""
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-    sorted_indices_to_remove = cumulative_probs > p
-    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = 0
+def sample_tokens(logits, temperature=1.0, top_k=0, top_p=1.0):
+    """从logits中采样tokens，支持温度调节、top-k和top-p采样
     
-    indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-    probs[indices_to_remove] = 0.0
-    return probs
+    Args:
+        logits: 模型的原始输出logits [..., vocab_size]
+        temperature: 温度参数(>0)，值越小越确定，越大越随机
+        top_k: 仅从概率最高的k个token中采样(0表示禁用)
+        top_p: nucleus采样参数(0-1)，从累积概率超过p的最小token集合中采样
+    
+    Returns:
+        采样得到的token索引 [..., 1]
+    """
+    # 防止除零错误
+    temperature = max(temperature, 1e-5)
+    
+    # 应用温度调节
+    if temperature != 1.0:
+        logits = logits / temperature
+    
+    # 计算概率分布
+    probs = torch.softmax(logits, dim=-1)
+    
+    # top-k过滤
+    if top_k > 0:
+        top_k = min(top_k, probs.size(-1))  # 确保不超过词汇表大小
+        top_probs, top_indices = torch.topk(probs, top_k, dim=-1)
+        probs = torch.zeros_like(probs).scatter_(-1, top_indices, top_probs)
+    
+    # top-p (nucleus) 过滤
+    if top_p < 1.0:
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        # 创建mask：移除累积概率超过p的token，但要保留第一个超出阈值的位置
+        mask = cumulative_probs > top_p
+        mask[..., 1:] = mask[..., :-1].clone()
+        mask[..., 0] = False
+        
+        # 将masked位置的概率设为0
+        sorted_probs[mask] = 0.0
+        
+        # 重新归一化概率
+        sorted_probs.div_(sorted_probs.sum(dim=-1, keepdim=True))
+        
+        # 恢复原始顺序
+        probs = sorted_probs.gather(-1, sorted_indices.argsort(-1))
+    
+    # 从处理后的分布中采样
+    return torch.multinomial(probs, num_samples=1)
 
-def sample_top_k(probs, k):
-    """Top-k sampling"""
-    top_k_probs, top_k_indices = torch.topk(probs, k, dim=-1)
-    mask = torch.zeros_like(probs, dtype=torch.bool)
-    mask.scatter_(-1, top_k_indices, True)
-    probs[~mask] = 0.0
-    return probs
-
-def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, temperature=0.0):
+def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, temperature=0.0, top_k=0, top_p=1.0):
     """自回归生成tokens"""
     model.eval()
     generated_tokens = input_ids.clone()
@@ -265,8 +286,7 @@ def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, t
             # 获取logits
             logits = model(generated_tokens)  # [batch_size, vocab_size]
             
-            # 贪婪采样：直接选择最大概率的token
-            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            next_token = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
             
             # 添加到生成的序列中
             generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
@@ -337,8 +357,11 @@ def main():
         generated_tokens = generate_tokens_autoregressive(
             custom_model, 
             tokenizer, 
-            input_ids, 
-            max_tokens=100
+            input_ids,
+            temperature=1.0,
+            max_tokens=100,
+            top_k=50,
+            top_p=0.9
         )
         
         print('generated_tokens:', generated_tokens)
