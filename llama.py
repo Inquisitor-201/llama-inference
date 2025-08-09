@@ -276,13 +276,19 @@ def sample_tokens(logits, temperature=1.0, top_k=0, top_p=1.0):
     # 从处理后的分布中采样
     return torch.multinomial(probs, num_samples=1)
 
+import time
+
 def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, temperature=0.0, top_k=0, top_p=1.0):
-    """自回归生成tokens"""
+    """自回归生成tokens, 并测量每个token生成时间"""
     model.eval()
     generated_tokens = input_ids.clone()
+    total_time = 0.0
+    token_times = []
     
     with torch.no_grad():
-        for _ in range(max_tokens):
+        for i in range(max_tokens):
+            start_time = time.time()
+            
             # 获取logits
             logits = model(generated_tokens)  # [batch_size, vocab_size]
             
@@ -291,9 +297,25 @@ def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, t
             # 添加到生成的序列中
             generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
             
+            # 记录单个token生成时间
+            elapsed = time.time() - start_time
+            token_times.append(elapsed)
+            total_time += elapsed
+            
+            print(f"Token {i+1} 生成时间: {elapsed:.4f}秒")
+            
             # 检查是否生成了结束token
             if next_token.item() == tokenizer.eos_token_id:
                 break
+    
+    # 输出统计信息
+    print("\n生成统计:")
+    print(f"总生成token数: {len(token_times)}")
+    print(f"总耗时: {total_time:.4f}秒")
+    print(f"平均每个token生成时间: {total_time/len(token_times):.4f}秒")
+    if len(token_times) > 1:
+        print(f"最快生成时间: {min(token_times):.4f}秒")
+        print(f"最慢生成时间: {max(token_times):.4f}秒")
     
     return generated_tokens
 
@@ -348,9 +370,9 @@ def main():
         # print(f"解码回文本: '{decoded_back}'")
         
         # 测试logits输出
-        print("\n=== 测试logits输出 ===")
-        logits = custom_model(input_ids)
-        print("logits:", logits.reshape(-1,)[64:128])
+        # print("\n=== 测试logits输出 ===")
+        # logits = custom_model(input_ids)
+        # print("logits:", logits.reshape(-1,)[64:128])
 
         # # 自回归生成
         print("\n开始自回归生成...")
@@ -360,8 +382,8 @@ def main():
             input_ids,
             temperature=1.0,
             max_tokens=100,
-            top_k=50,
-            top_p=0.9
+            top_k=1,
+            top_p=1.0
         )
         
         print('generated_tokens:', generated_tokens)
