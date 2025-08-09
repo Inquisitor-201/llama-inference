@@ -6,6 +6,10 @@ from typing import Dict, Any, Tuple
 import math
 from transformers import AutoTokenizer
 
+# 检测并设置设备（添加在顶部）
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
+
 # 修复的RMSNorm实现
 class FixedRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -182,7 +186,7 @@ def load_llama_config(config_path: str = "config.json") -> Dict[str, Any]:
 
 def load_llama_weights(weights_path: str = "model.safetensors") -> Dict[str, torch.Tensor]:
     """加载模型权重文件"""
-    return load_file(weights_path, device="cpu")  # 先加载到CPU
+    return load_file(weights_path, device="cuda" if torch.cuda.is_available() else "cpu")  # 加载到指定的设备
 
 def map_weights_to_custom_model(
     custom_model: CustomLlamaModel, 
@@ -339,8 +343,8 @@ def main():
     print(f"Tokenizer词汇表大小: {tokenizer.vocab_size}")
     print(f"EOS token ID: {tokenizer.eos_token_id}")
     
-    # 创建自定义模型
-    custom_model = CustomLlamaModel(config)
+    # 创建自定义模型并移到设备
+    custom_model = CustomLlamaModel(config).to(device)
     print("custom model:", custom_model.state_dict().keys())
     # 加载原始权重
     original_weights = load_llama_weights("models/TinyStories-656K/model.safetensors")
@@ -353,28 +357,15 @@ def main():
     
     # 测试自回归生成
     with torch.no_grad():
-        # # 准备输入文本
+        # 准备输入文本
         input_text = "One day, a girl named Lily went for a "
         print(f"\n输入文本: '{input_text}'")
         
-        # # 编码输入文本
-        input_ids = tokenizer.encode(input_text, return_tensors="pt", add_special_tokens=True)
+        # 编码输入文本并移到设备
+        input_ids = tokenizer.encode(input_text, return_tensors="pt", add_special_tokens=True).to(device)
         print(f"输入tokens: {input_ids[0].tolist()}")
         
-        # # 调试：比较与main.py的差异
-        # print(f"main.py的输入tokens: [1, 80, 429, 1168, 303, 1444]")
-        # print(f"我们的输入tokens: {input_ids[0].tolist()}")
-        
-        # 检查tokenizer是否正确
-        # decoded_back = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        # print(f"解码回文本: '{decoded_back}'")
-        
-        # 测试logits输出
-        # print("\n=== 测试logits输出 ===")
-        # logits = custom_model(input_ids)
-        # print("logits:", logits.reshape(-1,)[64:128])
-
-        # # 自回归生成
+        # 自回归生成
         print("\n开始自回归生成...")
         generated_tokens = generate_tokens_autoregressive(
             custom_model, 
@@ -387,24 +378,11 @@ def main():
         )
         
         print('generated_tokens:', generated_tokens)
-        # # 解码生成的文本
+        # 解码生成的文本
         generated_text = decode_tokens_to_text(tokenizer, generated_tokens)
         
         print(f"\n生成的tokens: {generated_tokens[0].tolist()}")
         print(f"生成的文本: '{generated_text}'")
-        
-        # # 显示生成过程
-        # print("\n生成过程:")
-        # current_tokens = input_ids.clone()
-        # for i in range(min(10, len(generated_tokens[0]) - len(input_ids[0]))):
-        #     current_text = decode_tokens_to_text(tokenizer, current_tokens)
-        #     print(f"步骤 {i+1}: '{current_text}'")
-            
-        #     # 获取下一个token
-        #     logits = custom_model(current_tokens)
-        #     next_token = torch.argmax(logits, dim=-1, keepdim=True)
-        #     current_tokens = torch.cat([current_tokens, next_token], dim=-1)
 
 if __name__ == "__main__":
     main()
-    
