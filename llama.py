@@ -5,13 +5,13 @@ from safetensors.torch import load_file
 from typing import Dict, Any, Tuple
 import math
 from transformers import AutoTokenizer
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # 检测并设置设备（添加在顶部）
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
 
-# 修复的RMSNorm实现
-class FixedRMSNorm(nn.Module):
+class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -133,7 +133,7 @@ class CustomLlamaModel(torch.nn.Module):
         ])
 
         # 输出层归一化
-        self.norm = FixedRMSNorm(self.hidden_size, eps=config["rms_norm_eps"])
+        self.norm = LlamaRMSNorm(self.hidden_size, eps=config["rms_norm_eps"])
         
         # 独立的lm_head层
         self.lm_head = torch.nn.Linear(self.hidden_size, self.vocab_size, bias=False)
@@ -148,8 +148,8 @@ class CustomLlamaModel(torch.nn.Module):
                 theta=config["rope_theta"]
             ),
             "mlp": MLP(config),
-            "input_layernorm": FixedRMSNorm(config["hidden_size"], eps=config["rms_norm_eps"]),
-            "post_attention_layernorm": FixedRMSNorm(config["hidden_size"], eps=config["rms_norm_eps"])
+            "input_layernorm": LlamaRMSNorm(config["hidden_size"], eps=config["rms_norm_eps"]),
+            "post_attention_layernorm": LlamaRMSNorm(config["hidden_size"], eps=config["rms_norm_eps"])
         })
 
     def forward(self, input_ids):
@@ -288,30 +288,43 @@ def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, t
     generated_tokens = input_ids.clone()
     total_time = 0.0
     token_times = []
-    
-    with torch.no_grad():
-        for i in range(max_tokens):
-            start_time = time.time()
-            
-            # 获取logits
-            logits = model(generated_tokens)  # [batch_size, vocab_size]
-            
-            next_token = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
-            
-            # 添加到生成的序列中
-            generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
-            
-            # 记录单个token生成时间
-            elapsed = time.time() - start_time
-            token_times.append(elapsed)
-            total_time += elapsed
-            
-            print(f"Token {i+1} 生成时间: {elapsed:.4f}秒")
-            
-            # 检查是否生成了结束token
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-    
+
+    # 创建性能分析器
+    with profile(
+        activities=[
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA if torch.cuda.is_available() else ProfilerActivity.CPU
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_flops=True
+    ) as prof:
+        with torch.no_grad():
+            for i in range(max_tokens):
+                start_time = time.time()
+                
+                # 获取logits
+                with record_function("model_inference"):
+                    logits = model(generated_tokens)  # [batch_size, vocab_size]
+                
+                with record_function("token_sampling"):
+                    next_token = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+                
+                # 添加到生成的序列中
+                generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
+                
+                # 记录单个token生成时间
+                elapsed = time.time() - start_time
+                token_times.append(elapsed)
+                total_time += elapsed
+                
+                # print(f"Token {i+1} 生成时间: {elapsed:.4f}秒")
+                
+                # 检查是否生成了结束token
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
+
     # 输出统计信息
     print("\n生成统计:")
     print(f"总生成token数: {len(token_times)}")
@@ -320,7 +333,15 @@ def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, t
     if len(token_times) > 1:
         print(f"最快生成时间: {min(token_times):.4f}秒")
         print(f"最慢生成时间: {max(token_times):.4f}秒")
-    
+
+    # 打印性能分析摘要
+    print("\n性能分析摘要:")
+    print(prof.key_averages().table(sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total", row_limit=10))
+            
+    # 导出性能数据
+    prof.export_chrome_trace("trace.json")
+    print("性能追踪文件已保存为 trace.json")
+
     return generated_tokens
 
 def decode_tokens_to_text(tokenizer, tokens):
@@ -372,7 +393,7 @@ def main():
             tokenizer, 
             input_ids,
             temperature=1.0,
-            max_tokens=100,
+            max_tokens=30,
             top_k=1,
             top_p=1.0
         )
