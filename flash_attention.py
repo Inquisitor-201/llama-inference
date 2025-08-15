@@ -178,11 +178,13 @@ def flash_attentionv2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                       cos: torch.Tensor, sin: torch.Tensor,
                       Br: int, Bc: int,
                       use_rope: bool) -> torch.Tensor:
-    batch, q_heads, _, _ = q.shape
+    batch, q_heads, q_seq_length, q_head_dim = q.shape
     k_heads = k.shape[1]
     q_per_kv = q_heads // k_heads
 
     if use_rope:
+        assert cos.shape[0] == q_seq_length
+        assert sin.shape[0] == q_seq_length
         q = _rope(q, cos, sin)
         k = _rope(k, cos, sin)
 
@@ -190,7 +192,7 @@ def flash_attentionv2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     o = torch.empty_like(q)
     # Intermediate tensors
     
-    grid = (batch, q_heads, triton.cdiv(q.shape[-2], Br))
+    grid = (batch, q_heads, triton.cdiv(q_seq_length, Br))
     
     flash_attentionv2_kernel[grid](
         q, k, v, o,

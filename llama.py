@@ -2,10 +2,10 @@ import json
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file
-from typing import Dict, Any, Tuple
-import math
+from typing import Dict, Any
 from transformers import AutoTokenizer
 from torch.profiler import profile, record_function, ProfilerActivity
+from flash_attention import flash_attentionv2
 
 # 检测并设置设备（添加在顶部）
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,6 +103,51 @@ class GroupedQueryAttention(torch.nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         # attn_output (merged heads): [batch_size, seq_len, hidden_size]
         return self.o_proj(attn_output)
+
+class GroupedQueryAttentionOpt(torch.nn.Module):
+    def __init__(self, hidden_size, num_heads_q, num_heads_kv, theta, max_seq_len=1024):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.head_dim = hidden_size // num_heads_q
+        self.num_heads_q = num_heads_q
+        self.num_heads_kv = num_heads_kv
+        self.theta = theta
+
+        # 确保query头数能被key/value头数整除，这是GQA的要求
+        assert num_heads_q % num_heads_kv == 0, "num_heads_q must be divisible by num_heads_kv"
+        self.q_per_kv = num_heads_q // num_heads_kv  # 每个kv头对应的q头数量
+
+        self.q_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = torch.nn.Linear(hidden_size, num_heads_kv * self.head_dim, bias=False)
+        self.v_proj = torch.nn.Linear(hidden_size, num_heads_kv * self.head_dim, bias=False)
+        self.o_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+        self._cos, self._sin = self._calc_rope_freqs(seq_len=max_seq_len, head_dim=self.head_dim, theta=self.theta)
+
+    def _calc_rope_freqs(seq_len, head_dim, theta=10000.0, device='cuda'):
+        # 计算频率（仅计算前半部分）
+        _theta = (theta ** (-torch.arange(0, head_dim, 2, device=device) / head_dim))
+        seq_idx = torch.arange(seq_len, device=device).unsqueeze(1)
+        freqs = seq_idx * _theta
+        return freqs.cos(), freqs.sin()
+
+    def _rope(x, _cos, _sin):
+        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        rotated = torch.cat([x1 * _cos - x2 * _sin, x2 * _cos + x1 * _sin], dim=-1)
+        return rotated
+
+    def forward(self, x, Br=32, Bc=32):
+        batch_size, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads_q, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads_kv, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads_kv, self.head_dim).transpose(1, 2)
+
+        attn_output = flash_attentionv2(q, k, v, self._cos[:seq_len, ...], self._sin[:seq_len, ...], Br, Bc, use_rope=True)
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        # attn_output (merged heads): [batch_size, seq_len, hidden_size]
+        return self.o_proj(attn_output)        
 
 class MLP(torch.nn.Module):
     def __init__(self, config):
