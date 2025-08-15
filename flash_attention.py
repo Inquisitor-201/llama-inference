@@ -8,9 +8,35 @@ import math
 
 torch.manual_seed(0)
 
-def standard_softmax_attention(q, k, v, causal=False):
+def standard_rope(x, theta=10000.0):
+    # x: [batch_size, num_heads, seq_len, head_dim]
+    batch_size, num_heads, seq_len, head_dim = x.shape
+    device = x.device
+    assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+
+    # 生成频率（仅计算前半部分）
+    theta = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device)[:head_dim//2] / head_dim))
+    seq_idx = torch.arange(seq_len, device=device).unsqueeze(1)
+    freqs = seq_idx * theta  # [seq_len, dim//2]
+
+    # 计算cos和sin（前后半部分共享）
+    cos = freqs.cos()  # [seq_len, dim//2]
+    sin = freqs.sin()
+
+    # 拆分前后半部分
+    x1, x2 = x[..., :head_dim//2], x[..., head_dim//2:]
+
+    # 旋转并合并
+    rotated = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    return rotated
+
+def standard_softmax_attention(q, k, v, use_rope=False, causal=False):
     batch_size, q_heads, seq_len, head_dim = q.shape
     k_heads = k.shape[1]
+
+    if use_rope:
+        q = standard_rope(q)
+        k = standard_rope(k)
 
     q_per_kv = q_heads // k_heads
 
@@ -31,6 +57,45 @@ def standard_softmax_attention(q, k, v, causal=False):
     # attn_output: [batch_size, num_heads_q, seq_len, head_dim]
 
     return attn_weights, attn_output
+
+def _calc_rope_freqs(seq_len, head_dim, theta=10000.0, device='cuda'):
+    # 计算频率（仅计算前半部分）
+    _theta = (theta ** (-torch.arange(0, head_dim, 2, device=device) / head_dim))
+    seq_idx = torch.arange(seq_len, device=device).unsqueeze(1)
+    freqs = seq_idx * _theta
+    return freqs.cos(), freqs.sin()
+
+def _rope(x, _cos, _sin):
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    rotated = torch.cat([x1 * _cos - x2 * _sin, x2 * _cos + x1 * _sin], dim=-1)
+    return rotated
+
+# @triton.jit
+# def _rope(x, cos, sin, BLOCK_DMODEL: tl.constexpr):
+#     """
+#     RoPE (Rotary Position Embedding) 实现
+#     参数:
+#         x: 输入张量 [BLOCK_M, BLOCK_DMODEL]
+#         cos: cos 频率参数 [BLOCK_M, BLOCK_DMODEL//2]
+#         sin: sin 频率参数 [BLOCK_M, BLOCK_DMODEL//2]
+#         BLOCK_DMODEL: 头维度大小（常量）
+#     """
+#     # 计算前半部分和后半部分的偏移量
+#     # x1_offsets = tl.arange(0, BLOCK_DMODEL // 2)
+#     # x2_offsets = tl.arange(BLOCK_DMODEL // 2, BLOCK_DMODEL)
+    
+#     # 提取输入张量的前后两部分
+#     x1 = x[:, :BLOCK_DMODEL // 2]  # [BLOCK_M, half_d]
+#     x2 = x[:, BLOCK_DMODEL // 2:]  # [BLOCK_M, half_d]
+    
+#     # 应用旋转位置编码公式:
+#     # rotated = [x1 * cos - x2 * sin, x2 * cos + x1 * sin]
+#     part1 = x1 * cos - x2 * sin
+#     part2 = x2 * cos + x1 * sin
+    
+#     # 合并两部分结果
+#     rotated = tl.cat([part1, part2], axis=1)
+#     return rotated
 
 @triton.jit #(debug=True)
 def flash_attentionv2_kernel(
@@ -59,7 +124,17 @@ def flash_attentionv2_kernel(
     d_offsets = tl.arange(0, BLOCK_DMODEL)
     q = tl.load(Q + q_off_hz + q_offsets[:, None] * stride_qm + d_offsets[None, :] * stride_qd,
                 mask=q_offsets[:, None] < q_len, other=0.0)
-    
+
+    # sc_d_offsets = tl.arange(0, BLOCK_DMODEL // 2)
+    # # 加载RoPE的频率参数（COS/SIN）
+    # _cos = tl.load(COS + q_offsets[:, None] * BLOCK_DMODEL // 2 + sc_d_offsets[None, :],
+    #                 mask=q_offsets[:, None] < q_len, other=1.0)
+    # _sin = tl.load(SIN + q_offsets[:, None] * BLOCK_DMODEL // 2 + sc_d_offsets[None, :],
+    #                 mask=q_offsets[:, None] < q_len, other=0.0)
+
+    # q = _rope(q, _cos, _sin, BLOCK_DMODEL)
+    # k = _rope(k, _cos, _sin, BLOCK_DMODEL)
+
     L_i = tl.zeros([BLOCK_M, 1], dtype=tl.float32)
     m_i = tl.zeros([BLOCK_M, 1], dtype=tl.float32) - float("inf")
     
@@ -99,10 +174,17 @@ def flash_attentionv2_kernel(
     o = acc_o / L_i
     tl.store(O + o_off_hz + q_offsets[:, None] * stride_om + d_offsets[None, :] * stride_od, o, mask=q_offsets[:, None] < q_len)
 
-def flash_attentionv2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, Br: int, Bc: int) -> torch.Tensor:
+def flash_attentionv2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                      cos: torch.Tensor, sin: torch.Tensor,
+                      Br: int, Bc: int,
+                      use_rope: bool) -> torch.Tensor:
     batch, q_heads, _, _ = q.shape
     k_heads = k.shape[1]
     q_per_kv = q_heads // k_heads
+
+    if use_rope:
+        q = _rope(q, cos, sin)
+        k = _rope(k, cos, sin)
 
     # Output tensor
     o = torch.empty_like(q)
@@ -125,12 +207,12 @@ def flash_attentionv2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, Br: int
     return o
 
 # 创建示例数据
-BATCH_SIZE, N_CTX = 32, 512
+BATCH_SIZE, N_CTX = 64, 1024
 NHQ, NHKV, DI = 8, 4, 16
 # SM_M = 101376
-Q = 0.1 * torch.randn((BATCH_SIZE, NHQ, N_CTX, DI), device='cuda', dtype=torch.float32)
-K = 0.1 * torch.randn((BATCH_SIZE, NHKV, N_CTX, DI), device='cuda', dtype=torch.float32)
-V = 10 * torch.randn((BATCH_SIZE, NHKV, N_CTX, DI), device='cuda', dtype=torch.float32)
+Q = torch.randn((BATCH_SIZE, NHQ, N_CTX, DI), device='cuda', dtype=torch.float32)
+K = torch.randn((BATCH_SIZE, NHKV, N_CTX, DI), device='cuda', dtype=torch.float32)
+V = torch.randn((BATCH_SIZE, NHKV, N_CTX, DI), device='cuda', dtype=torch.float32)
 
 q_batch_size, q_heads, q_seq_length, q_head_dim = Q.shape
 k_batch_size, k_heads, k_seq_length, k_head_dim = K.shape
@@ -142,10 +224,12 @@ assert q_head_dim == k_head_dim and k_head_dim == v_head_dim
 Br = min(64, Q.shape[-2])  # 至少考虑序列长度
 Bc = min(64, K.shape[-2])
 
-# 调用 Flash Attention
-output = flash_attentionv2(Q, K, V, Br, Bc)
+_cos, _sin = _calc_rope_freqs(q_seq_length, q_head_dim, device='cuda')
 
-_, expected_attention = standard_softmax_attention(Q, K, V)
+# 调用 Flash Attention
+output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
+
+_, expected_attention = standard_softmax_attention(Q, K, V, use_rope=True)
 
 print("=========compare=========")
 print(output.shape,expected_attention.shape)
@@ -154,5 +238,37 @@ print(expected_attention)
 
 print("Max difference:", torch.max(torch.abs(output - expected_attention)))
 print("Mean difference:", torch.mean(torch.abs(output - expected_attention)))
-assert torch.allclose(output, expected_attention, rtol=1e-2), "Error in flash attention calculation"
+assert torch.allclose(output, expected_attention, atol=1e-2), "Error in flash attention calculation"
 print("Hooray! Flash attention calculation is correct!")
+
+# --------------------------------------------
+
+from torch.profiler import profile, record_function, ProfilerActivity
+
+N = 100
+
+for _ in range(N//5):
+    # 调用 Flash Attention
+    # output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
+    _, expected_attention = standard_softmax_attention(Q, K, V, use_rope=True)
+
+with profile(
+    activities=[
+        ProfilerActivity.CPU,
+        ProfilerActivity.CUDA if torch.cuda.is_available() else ProfilerActivity.CPU
+    ],
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True,
+    with_flops=True
+) as prof:
+    with torch.no_grad():
+        _cos, _sin = _calc_rope_freqs(q_seq_length, q_head_dim, device='cuda')
+
+        for _ in range(N):
+            # 调用 Flash Attention
+            output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
+            # _, expected_attention = standard_softmax_attention(Q, K, V, use_rope=True)
+            
+print(prof.key_averages().table(sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total", row_limit=10))
+prof.export_chrome_trace("trace-opt.json")
