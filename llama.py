@@ -124,7 +124,7 @@ class GroupedQueryAttentionOpt(torch.nn.Module):
 
         self._cos, self._sin = self._calc_rope_freqs(seq_len=max_seq_len, head_dim=self.head_dim, theta=self.theta)
 
-    def _calc_rope_freqs(seq_len, head_dim, theta=10000.0, device='cuda'):
+    def _calc_rope_freqs(self, seq_len, head_dim, theta=10000.0, device='cuda'):
         # 计算频率（仅计算前半部分）
         _theta = (theta ** (-torch.arange(0, head_dim, 2, device=device) / head_dim))
         seq_idx = torch.arange(seq_len, device=device).unsqueeze(1)
@@ -143,7 +143,12 @@ class GroupedQueryAttentionOpt(torch.nn.Module):
         k = self.k_proj(x).view(batch_size, seq_len, self.num_heads_kv, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_heads_kv, self.head_dim).transpose(1, 2)
 
-        attn_output = flash_attentionv2(q, k, v, self._cos[:seq_len, ...], self._sin[:seq_len, ...], Br, Bc, use_rope=True)
+        attn_output = flash_attentionv2(
+            q, k, v,
+            self._cos[:seq_len, ...], self._sin[:seq_len, ...],
+            Br, Bc,
+            use_rope=True, causal=True
+        )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         # attn_output (merged heads): [batch_size, seq_len, hidden_size]
@@ -327,12 +332,18 @@ def sample_tokens(logits, temperature=1.0, top_k=0, top_p=1.0):
 
 import time
 
-def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, temperature=0.0, top_k=0, top_p=1.0):
+def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, temperature=0.0, top_k=0, top_p=1.0, check_eos=True):
     """自回归生成tokens, 并测量每个token生成时间"""
     model.eval()
     generated_tokens = input_ids.clone()
     total_time = 0.0
     token_times = []
+
+    # Warmup ...
+    for _ in range(10):
+        logits = model(generated_tokens)
+        _next_token = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+    torch.cuda.synchronize()  # 确保所有CUDA操作完成
 
     # 创建性能分析器
     with profile(
@@ -346,7 +357,7 @@ def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, t
         with_flops=True
     ) as prof:
         with torch.no_grad():
-            for i in range(max_tokens):
+            while generated_tokens[0].shape[-1] < max_tokens:
                 start_time = time.time()
                 
                 # 获取logits
@@ -365,9 +376,9 @@ def generate_tokens_autoregressive(model, tokenizer, input_ids, max_tokens=50, t
                 total_time += elapsed
                 
                 # print(f"Token {i+1} 生成时间: {elapsed:.4f}秒")
-                
+
                 # 检查是否生成了结束token
-                if next_token.item() == tokenizer.eos_token_id:
+                if check_eos and next_token.item() == tokenizer.eos_token_id:
                     break
 
     # 输出统计信息
@@ -424,7 +435,14 @@ def main():
     # 测试自回归生成
     with torch.no_grad():
         # 准备输入文本
-        input_text = "One day, a girl named Lily went for a "
+        # input_text = "One day, a girl named Lily went for a "
+        input_text = "One day, a girl named Lily went for a walk in the park. "
+        "She saw a pretty bird on the ground. The bird wanted to fly high like the bird. The bird wanted to fly high in the sky."
+        "Lily flew up to the tree and reached the bird. The bird flew down and reached the bird. The bird was flying high in the sky."
+        "The bird was flying, and the birds were happy. A kind bird saw the bird and said, "
+        "Hi, bird! Can I fly with you? The bird said, Yes, you can fly too! Let's play together."
+        "They both smiled and played together all day. They had lots of fun and became good friends. The girl "
+
         print(f"\n输入文本: '{input_text}'")
         
         # 编码输入文本并移到设备
@@ -438,9 +456,10 @@ def main():
             tokenizer, 
             input_ids,
             temperature=1.0,
-            max_tokens=30,
+            max_tokens=1024,
             top_k=1,
-            top_p=1.0
+            top_p=1.0,
+            check_eos=False
         )
         
         print('generated_tokens:', generated_tokens)

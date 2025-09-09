@@ -177,7 +177,7 @@ def flash_attentionv2_kernel(
 def flash_attentionv2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                       cos: torch.Tensor, sin: torch.Tensor,
                       Br: int, Bc: int,
-                      use_rope: bool) -> torch.Tensor:
+                      use_rope: bool=True, causal: bool=True) -> torch.Tensor:
     batch, q_heads, q_seq_length, q_head_dim = q.shape
     k_heads = k.shape[1]
     q_per_kv = q_heads // k_heads
@@ -203,74 +203,76 @@ def flash_attentionv2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         q_per_kv,
         0, q.shape[-2], k.shape[-2],
         BLOCK_M=Br, BLOCK_DMODEL=q.shape[-1], BLOCK_N=Bc,
-        causal=False,  # Set to 1 for causal attention
+        causal=causal,  # Set to 1 for causal attention
     )
     
+    torch.cuda.synchronize()  # 确保所有CUDA操作完成
     return o
 
-# 创建示例数据
-BATCH_SIZE, N_CTX = 64, 1024
-NHQ, NHKV, DI = 8, 4, 16
-# SM_M = 101376
-Q = torch.randn((BATCH_SIZE, NHQ, N_CTX, DI), device='cuda', dtype=torch.float32)
-K = torch.randn((BATCH_SIZE, NHKV, N_CTX, DI), device='cuda', dtype=torch.float32)
-V = torch.randn((BATCH_SIZE, NHKV, N_CTX, DI), device='cuda', dtype=torch.float32)
+if __name__ == "__main__":
+    # 创建示例数据
+    BATCH_SIZE, N_CTX = 64, 1024
+    NHQ, NHKV, DI = 8, 4, 16
+    # SM_M = 101376
+    Q = torch.randn((BATCH_SIZE, NHQ, N_CTX, DI), device='cuda', dtype=torch.float32)
+    K = torch.randn((BATCH_SIZE, NHKV, N_CTX, DI), device='cuda', dtype=torch.float32)
+    V = torch.randn((BATCH_SIZE, NHKV, N_CTX, DI), device='cuda', dtype=torch.float32)
 
-q_batch_size, q_heads, q_seq_length, q_head_dim = Q.shape
-k_batch_size, k_heads, k_seq_length, k_head_dim = K.shape
-v_batch_size, v_heads, v_seq_length, v_head_dim = V.shape
+    q_batch_size, q_heads, q_seq_length, q_head_dim = Q.shape
+    k_batch_size, k_heads, k_seq_length, k_head_dim = K.shape
+    v_batch_size, v_heads, v_seq_length, v_head_dim = V.shape
 
-assert q_batch_size == k_batch_size and k_batch_size == v_batch_size
-assert q_heads % k_heads == 0 and k_heads == v_heads
-assert q_head_dim == k_head_dim and k_head_dim == v_head_dim
-Br = min(64, Q.shape[-2])  # 至少考虑序列长度
-Bc = min(64, K.shape[-2])
+    assert q_batch_size == k_batch_size and k_batch_size == v_batch_size
+    assert q_heads % k_heads == 0 and k_heads == v_heads
+    assert q_head_dim == k_head_dim and k_head_dim == v_head_dim
+    Br = min(64, Q.shape[-2])  # 至少考虑序列长度
+    Bc = min(64, K.shape[-2])
 
-_cos, _sin = _calc_rope_freqs(q_seq_length, q_head_dim, device='cuda')
+    _cos, _sin = _calc_rope_freqs(q_seq_length, q_head_dim, device='cuda')
 
-# 调用 Flash Attention
-output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
-
-_, expected_attention = standard_softmax_attention(Q, K, V, use_rope=True)
-
-print("=========compare=========")
-print(output.shape,expected_attention.shape)
-print(output)
-print(expected_attention)
-
-print("Max difference:", torch.max(torch.abs(output - expected_attention)))
-print("Mean difference:", torch.mean(torch.abs(output - expected_attention)))
-assert torch.allclose(output, expected_attention, atol=1e-2), "Error in flash attention calculation"
-print("Hooray! Flash attention calculation is correct!")
-
-# --------------------------------------------
-
-from torch.profiler import profile, record_function, ProfilerActivity
-
-N = 100
-
-for _ in range(N//5):
     # 调用 Flash Attention
-    # output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
+    output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
+
     _, expected_attention = standard_softmax_attention(Q, K, V, use_rope=True)
 
-with profile(
-    activities=[
-        ProfilerActivity.CPU,
-        ProfilerActivity.CUDA if torch.cuda.is_available() else ProfilerActivity.CPU
-    ],
-    record_shapes=True,
-    profile_memory=True,
-    with_stack=True,
-    with_flops=True
-) as prof:
-    with torch.no_grad():
-        _cos, _sin = _calc_rope_freqs(q_seq_length, q_head_dim, device='cuda')
+    print("=========compare=========")
+    print(output.shape,expected_attention.shape)
+    print(output)
+    print(expected_attention)
 
-        for _ in range(N):
-            # 调用 Flash Attention
-            output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
-            # _, expected_attention = standard_softmax_attention(Q, K, V, use_rope=True)
-            
-print(prof.key_averages().table(sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total", row_limit=10))
-prof.export_chrome_trace("trace-opt.json")
+    print("Max difference:", torch.max(torch.abs(output - expected_attention)))
+    print("Mean difference:", torch.mean(torch.abs(output - expected_attention)))
+    assert torch.allclose(output, expected_attention, atol=1e-2), "Error in flash attention calculation"
+    print("Hooray! Flash attention calculation is correct!")
+
+    # --------------------------------------------
+
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+    N = 100
+
+    for _ in range(N//5):
+        # 调用 Flash Attention
+        # output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
+        _, expected_attention = standard_softmax_attention(Q, K, V, use_rope=True)
+
+    with profile(
+        activities=[
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA if torch.cuda.is_available() else ProfilerActivity.CPU
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_flops=True
+    ) as prof:
+        with torch.no_grad():
+            _cos, _sin = _calc_rope_freqs(q_seq_length, q_head_dim, device='cuda')
+
+            for _ in range(N):
+                # 调用 Flash Attention
+                output = flash_attentionv2(Q, K, V, _cos, _sin, Br, Bc, use_rope=True)
+                # _, expected_attention = standard_softmax_attention(Q, K, V, use_rope=True)
+                
+    print(prof.key_averages().table(sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total", row_limit=10))
+    prof.export_chrome_trace("trace-opt.json")

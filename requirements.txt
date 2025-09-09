@@ -3,3 +3,4 @@ transformers>=4.30.0
 safetensors>=0.3.0
 accelerate>=0.20.0
 numpy>=1.20.0
+triton>=3.1.0
